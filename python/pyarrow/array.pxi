@@ -1038,8 +1038,14 @@ cdef class Array(_PandasConvertible):
                      memory_pool=memory_pool)
 
     def __reduce__(self):
-        return _restore_array, \
-            (_reduce_array_data(self.sp_array.get().data().get()),)
+        from pyarrow.ipc import RecordBatchStreamWriter
+        from pyarrow.lib import RecordBatch, BufferOutputStream
+
+        batch = RecordBatch.from_arrays([self], [""])
+        output_stream = BufferOutputStream()
+        with RecordBatchStreamWriter(output_stream, schema=batch.schema) as wr:
+            wr.write_batch(batch)
+        return _restore_array, (output_stream.getvalue(),)
 
     @staticmethod
     def from_buffers(DataType type, length, buffers, null_count=-1, offset=0,
@@ -2969,3 +2975,10 @@ def _empty_array(DataType type):
     else:
         arr = array([], type=type)
     return arr
+
+
+def _restore_array(buf):
+    from pyarrow.ipc import RecordBatchStreamReader
+
+    with RecordBatchStreamReader(buf) as reader:
+        return reader.read_next_batch().column(0)

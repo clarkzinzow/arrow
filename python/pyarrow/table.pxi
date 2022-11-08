@@ -67,7 +67,15 @@ cdef class ChunkedArray(_PandasConvertible):
         self.chunked_array = chunked_array.get()
 
     def __reduce__(self):
-        return chunked_array, (self.chunks, self.type)
+        from pyarrow.ipc import RecordBatchStreamWriter
+        from pyarrow.lib import RecordBatch, BufferOutputStream
+
+        # TODO: Support extension arrays, for which combine_chunks() doesn't work.
+        batch = RecordBatch.from_arrays([self.combine_chunks()], [""])
+        output_stream = BufferOutputStream()
+        with RecordBatchStreamWriter(output_stream, schema=batch.schema) as wr:
+            wr.write_batch(batch)
+        return _restore_chunked_array, (output_stream.getvalue(),)
 
     @property
     def data(self):
@@ -1262,6 +1270,13 @@ cdef class ChunkedArray(_PandasConvertible):
         return result
 
 
+def _restore_chunked_array(buf):
+    from pyarrow.ipc import RecordBatchStreamReader
+
+    with RecordBatchStreamReader(buf) as reader:
+        return chunked_array([reader.read_next_batch().column(0)])
+
+
 def chunked_array(arrays, type=None):
     """
     Construct chunked array from list of array-like objects
@@ -1601,7 +1616,13 @@ cdef class RecordBatch(_PandasConvertible):
                             metadata=metadata)
 
     def __reduce__(self):
-        return _reconstruct_record_batch, (self.columns, self.schema)
+        from pyarrow.ipc import RecordBatchStreamWriter
+        from pyarrow.lib import RecordBatch, BufferOutputStream
+
+        output_stream = BufferOutputStream()
+        with RecordBatchStreamWriter(output_stream, schema=self.schema) as wr:
+            wr.write_batch(self)
+        return _reconstruct_record_batch, (output_stream.getvalue(),)
 
     def __len__(self):
         return self.batch.num_rows()
@@ -2560,11 +2581,14 @@ cdef class RecordBatch(_PandasConvertible):
         return pyarrow_wrap_batch(c_batch)
 
 
-def _reconstruct_record_batch(columns, schema):
+def _reconstruct_record_batch(buf):
     """
-    Internal: reconstruct RecordBatch from pickled components.
+    Internal: reconstruct RecordBatch from serialized IPC bytes.
     """
-    return RecordBatch.from_arrays(columns, schema=schema)
+    from pyarrow.ipc import RecordBatchStreamReader
+
+    with RecordBatchStreamReader(buf) as reader:
+        return reader.read_next_batch()
 
 
 def table_to_blocks(options, Table table, categories, extension_columns):
@@ -2785,10 +2809,13 @@ cdef class Table(_PandasConvertible):
                 check_status(self.table.Validate())
 
     def __reduce__(self):
-        # Reduce the columns as ChunkedArrays to avoid serializing schema
-        # data twice
-        columns = [col for col in self.columns]
-        return _reconstruct_table, (columns, self.schema)
+        from pyarrow.ipc import RecordBatchStreamWriter
+        from pyarrow.lib import RecordBatch, BufferOutputStream
+
+        output_stream = BufferOutputStream()
+        with RecordBatchStreamWriter(output_stream, schema=self.schema) as wr:
+            wr.write_table(self)
+        return _reconstruct_table, (output_stream.getvalue(),)
 
     def __getitem__(self, key):
         """
@@ -4824,11 +4851,14 @@ cdef class Table(_PandasConvertible):
                                               output_type=Table)
 
 
-def _reconstruct_table(arrays, schema):
+def _reconstruct_table(buf):
     """
-    Internal: reconstruct pa.Table from pickled components.
+    Internal: reconstruct pa.Table from serialized IPC format.
     """
-    return Table.from_arrays(arrays, schema=schema)
+    from pyarrow.ipc import RecordBatchStreamReader
+
+    with RecordBatchStreamReader(buf) as reader:
+        return reader.read_all()
 
 
 def record_batch(data, names=None, schema=None, metadata=None):

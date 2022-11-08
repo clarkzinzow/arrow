@@ -313,6 +313,63 @@ def test_chunked_array_pickle(data, typ):
     assert result.equals(array)
 
 
+@pytest.mark.parametrize(
+    ('data', 'typ', 'cap_mult'),
+    [
+        # Int array.
+        (list(range(1000)) + [None], pa.int64(), 0.05),
+        # Float array.
+        (list(map(float, range(1000))) + [None], pa.float64(), 0.05),
+        # Boolean array.
+        ([True, False, None, True] * 2500, pa.bool_(), 0.5),
+        # String array.
+        (['a', 'b', 'cd', None, 'efg'] * 200, pa.string(), 0.1),
+        # List array.
+        ([[1, 2], [3], [None, 4, 5], [6]] * 250, pa.list_(pa.int64()), 0.05),
+        # Large list array.
+        (
+            [[4, 5], [6], [None, 7], [8, 9, 10]] * 250,
+            pa.large_list(pa.int16()),
+            0.05
+        ),
+        # String list array.
+        (
+            [['a'], None, ['b', 'cd'], ['efg']] * 250,
+            pa.list_(pa.string()),
+            0.1
+        ),
+        # Struct array.
+        (
+            [(1, 'a'), (2, 'c'), None, (3, 'b')] * 250,
+            pa.struct([pa.field('a', pa.int64()), pa.field('b', pa.string())]),
+            0.1
+        ),
+    ]
+)
+def test_chunked_array_pickle_slice_truncation(data, typ, cap_mult):
+    arrays = []
+    while data:
+        arrays.append(pa.array(data[:100], type=typ))
+        data = data[100:]
+    array = pa.chunked_array(arrays, type=typ)
+    array.validate()
+    buf_size = array.get_total_buffer_size()
+    ser_array = pickle.dumps(array)
+    slice_ = array.slice(10, 2)
+    ser_slice = pickle.dumps(slice_)
+    # Check that buffer was truncated upon serialization.
+    assert len(ser_slice) <= cap_mult * len(ser_array)
+    post_slice = pickle.loads(ser_slice)
+    # Check for post-roundtrip equality.
+    assert post_slice.equals(slice_)
+    # Check that offset was reset on slice.
+    assert post_slice.chunk(0).offset == 0
+    # Check that slice buffer only contains slice data.
+    slice_buf_size = post_slice.get_total_buffer_size()
+    if buf_size > 0:
+        assert buf_size / slice_buf_size - len(array) / len(post_slice) < 10
+
+
 @pytest.mark.pandas
 def test_chunked_array_to_pandas():
     import pandas as pd
@@ -655,6 +712,35 @@ def test_recordbatch_pickle():
     assert result.schema == schema
 
 
+def test_recordbatch_pickle_slice_truncation():
+    data = [
+        pa.array(range(1000), type='int32'),
+        pa.array([-10, -5, 0, 5, 10] * 200, type='float32')
+    ]
+    fields = [
+        pa.field('ints', pa.int32()),
+        pa.field('floats', pa.float32()),
+    ]
+    schema = pa.schema(fields, metadata={b'foo': b'bar'})
+    batch = pa.record_batch(data, schema=schema)
+    buf_size = batch.get_total_buffer_size()
+    ser_batch = pickle.dumps(batch)
+    slice_ = batch.slice(10, 2)
+    ser_slice = pickle.dumps(slice_)
+    # Check that buffer was truncated upon serialization.
+    assert len(ser_slice) <= 0.1 * len(ser_batch)
+    post_slice = pickle.loads(ser_slice)
+    # Check for post-roundtrip equality.
+    assert post_slice.equals(slice_)
+    # Check that offset was reset on slice.
+    for column in post_slice.columns:
+        assert column.offset == 0
+    # Check that slice buffer only contains slice data.
+    slice_buf_size = post_slice.get_total_buffer_size()
+    if buf_size > 0:
+        assert buf_size / slice_buf_size - len(batch) / len(post_slice) < 10
+
+
 def test_recordbatch_get_field():
     data = [
         pa.array(range(5)),
@@ -954,6 +1040,37 @@ def test_table_pickle():
     result = pickle.loads(pickle.dumps(table))
     result.validate()
     assert result.equals(table)
+
+
+def test_table_pickle_slice_truncation():
+    data = [
+        pa.chunked_array([[1, 2], [3, 4]] * 250, type=pa.uint32()),
+        pa.chunked_array(
+            [["some", "strings", None, ""]] * 250, type=pa.string()
+        ),
+    ]
+    schema = pa.schema([pa.field('ints', pa.uint32()),
+                        pa.field('strs', pa.string())],
+                       metadata={b'foo': b'bar'})
+    table = pa.Table.from_arrays(data, schema=schema)
+
+    buf_size = table.get_total_buffer_size()
+    ser_table = pickle.dumps(table)
+    slice_ = table.slice(10, 2)
+    ser_slice = pickle.dumps(slice_)
+    # Check that buffer was truncated upon serialization.
+    assert len(ser_slice) <= 0.1 * len(ser_table)
+    post_slice = pickle.loads(ser_slice)
+    post_slice.validate()
+    # Check for post-roundtrip equality.
+    assert post_slice.equals(slice_)
+    # Check that offset was reset on slice.
+    for column in post_slice.columns:
+        assert column.chunk(0).offset == 0
+    # Check that slice buffer only contains slice data.
+    slice_buf_size = post_slice.get_total_buffer_size()
+    if buf_size > 0:
+        assert buf_size / slice_buf_size - len(table) / len(post_slice) < 100
 
 
 def test_table_get_field():
