@@ -61,6 +61,31 @@ struct IpcPayload {
   int64_t raw_body_length = 0;  // initial uncompressed body length
 };
 
+/// \brief Options for serializing Arrow Arrays
+struct ARROW_EXPORT ArraySerializationOptions {
+  /// \brief If true, allow field lengths that don't fit in a signed 32-bit int.
+  ///
+  /// Some implementations may not be able to parse streams created with this option.
+  bool allow_64bit = false;
+
+  /// \brief The maximum permitted schema nesting depth.
+  int max_recursion_depth = kMaxNestingDepth;
+
+  /// \brief The memory pool to use for allocations made during IPC writing
+  ///
+  /// While Arrow IPC is predominantly zero-copy, it may have to allocate
+  /// memory in some cases (for example if compression is enabled).
+  MemoryPool* memory_pool = default_memory_pool();
+
+  /// \brief Format version to use for IPC messages and their metadata.
+  ///
+  /// Presently using V5 version (readable by 1.0.0 and later).
+  /// V4 is also available (readable by 0.8.0 and later).
+  MetadataVersion metadata_version = MetadataVersion::V5;
+
+  static ArraySerializationOptions Defaults();
+};
+
 struct WriteStats {
   /// Number of IPC messages written.
   int64_t num_messages = 0;
@@ -83,6 +108,45 @@ struct WriteStats {
   int64_t total_raw_body_size = 0;
   int64_t total_serialized_body_size = 0;
 };
+
+struct ARROW_EXPORT SerializedArrayPayload {
+  SerializedArrayPayload(std::shared_ptr<DataType> type, int64_t offset, int64_t length,
+                         int64_t null_count, std::vector<std::shared_ptr<Buffer>> buffers,
+                         std::vector<std::shared_ptr<SerializedArrayPayload>> children,
+                         std::shared_ptr<SerializedArrayPayload> parent = nullptr)
+      : type(type),
+        offset(offset),
+        length(length),
+        null_count(null_count),
+        buffers(buffers),
+        children(children),
+        parent(parent) {}
+
+  std::shared_ptr<DataType> type;
+  int64_t offset;
+  int64_t length;
+  int64_t null_count;
+  std::vector<std::shared_ptr<Buffer>> buffers;
+  std::vector<std::shared_ptr<SerializedArrayPayload>> children;
+  std::shared_ptr<SerializedArrayPayload> parent;
+
+  static std::shared_ptr<SerializedArrayPayload> Make(
+      std::shared_ptr<DataType> type, int64_t offset, int64_t length, int64_t null_count,
+      std::vector<std::shared_ptr<Buffer>> buffers =
+          std::vector<std::shared_ptr<Buffer>>(),
+      std::vector<std::shared_ptr<SerializedArrayPayload>> children =
+          std::vector<std::shared_ptr<SerializedArrayPayload>>()) {
+    return std::make_shared<SerializedArrayPayload>(std::move(type), offset, length,
+                                                    null_count, std::move(buffers),
+                                                    std::move(children));
+  };
+};
+
+ARROW_EXPORT Result<std::shared_ptr<SerializedArrayPayload>> SerializeArray(
+    std::shared_ptr<Array> arr);
+
+ARROW_EXPORT std::shared_ptr<Array> DeserializeArray(
+    std::shared_ptr<SerializedArrayPayload> payload);
 
 /// \class RecordBatchWriter
 /// \brief Abstract interface for writing a stream of record batches

@@ -1992,6 +1992,60 @@ def test_pickling(arr):
     assert arr.equals(restored)
 
 
+@pytest.mark.parametrize(
+    ('data', 'typ', 'cap_mult'),
+    [
+        # Int array.
+        (list(range(1000)) + [None], pa.int64(), 0.05),
+        # Float array.
+        (list(map(float, range(1000))) + [None], pa.float64(), 0.05),
+        # Boolean array.
+        ([True, False, None, True] * 2500, pa.bool_(), 0.5),
+        # String array.
+        (['a', 'b', 'cd', None, 'efg'] * 200, pa.string(), 0.1),
+        # List array.
+        ([[1, 2], [3], [None, 4, 5], [6]] * 250, pa.list_(pa.int64()), 0.05),
+        # Large list array.
+        (
+            [[4, 5], [6], [None, 7], [8, 9, 10]] * 250,
+            pa.large_list(pa.int16()),
+            0.05
+        ),
+        # String list array.
+        (
+            [['a'], None, ['b', 'cd'], ['efg']] * 250,
+            pa.list_(pa.string()),
+            0.1
+        ),
+        # Struct array.
+        (
+            [(1, 'a'), (2, 'c'), None, (3, 'b')] * 250,
+            pa.struct([pa.field('a', pa.int64()), pa.field('b', pa.string())]),
+            0.1
+        ),
+        # Empty array.
+        ([], None, 1),
+    ]
+)
+def test_array_pickle_slice_truncation(data, typ, cap_mult):
+    array = pa.array(data, type=typ)
+    buf_size = array.get_total_buffer_size()
+    ser_array = pickle.dumps(array)
+    slice_ = array.slice(10, 2)
+    ser_slice = pickle.dumps(slice_)
+    # Check that buffer was truncated upon serialization.
+    assert len(ser_slice) <= cap_mult * len(ser_array)
+    post_slice = pickle.loads(ser_slice)
+    # Check for post-roundtrip equality.
+    assert post_slice.equals(slice_)
+    # Check that offset was reset on slice.
+    assert post_slice.offset == 0
+    # Check that slice buffer only contains slice data.
+    slice_buf_size = post_slice.get_total_buffer_size()
+    if buf_size > 0:
+        assert buf_size / slice_buf_size - len(array) / len(post_slice) < 10
+
+
 @pickle_test_parametrize
 def test_array_pickle5(data, typ):
     # Test zero-copy pickling with protocol 5 (PEP 574)

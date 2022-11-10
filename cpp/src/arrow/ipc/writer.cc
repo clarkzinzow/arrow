@@ -125,20 +125,31 @@ static inline bool NeedTruncate(int64_t offset, const Buffer* buffer,
   return offset != 0 || min_length < buffer->size();
 }
 
-class RecordBatchSerializer {
+class BufferAggregator {
  public:
-  RecordBatchSerializer(int64_t buffer_start_offset,
-                        const std::shared_ptr<const KeyValueMetadata>& custom_metadata,
-                        const IpcWriteOptions& options, IpcPayload* out)
-      : out_(out),
-        custom_metadata_(custom_metadata),
+  /// \brief Preorder hook for an Array that's about to be serialized.
+  virtual void WithArray(const Array& arr) = 0;
+
+  /// \brief Buffer that has been serialized.
+  virtual void WithBuffer(std::shared_ptr<Buffer> buf) = 0;
+
+  /// \brief Postorder hook for an Array that's done being serialized.
+  virtual void SealArray(const Array& arr) {}
+
+  /// \brief Invoked before starting serialization for batch of Arrays.
+  virtual void Clear() = 0;
+};
+
+class ArraySerializer {
+ public:
+  ArraySerializer(const ArraySerializationOptions& options, BufferAggregator* buf_agg)
+      : buf_agg_(buf_agg),
         options_(options),
-        max_recursion_depth_(options.max_recursion_depth),
-        buffer_start_offset_(buffer_start_offset) {
+        max_recursion_depth_(options.max_recursion_depth) {
     DCHECK_GT(max_recursion_depth_, 0);
   }
 
-  virtual ~RecordBatchSerializer() = default;
+  virtual ~ArraySerializer() = default;
 
   Status VisitArray(const Array& arr) {
     static std::shared_ptr<Buffer> kNullBuffer = std::make_shared<Buffer>(nullptr, 0);
@@ -151,8 +162,7 @@ class RecordBatchSerializer {
       return Status::CapacityError("Cannot write arrays larger than 2^31 - 1 in length");
     }
 
-    // push back all common elements
-    field_nodes_.push_back({arr.length(), arr.null_count(), 0});
+    buf_agg_->WithArray(arr);
 
     // In V4, null types have no validity bitmap
     // In V5 and later, null and union types have no validity bitmap
@@ -161,108 +171,29 @@ class RecordBatchSerializer {
         std::shared_ptr<Buffer> bitmap;
         RETURN_NOT_OK(GetTruncatedBitmap(arr.offset(), arr.length(), arr.null_bitmap(),
                                          options_.memory_pool, &bitmap));
-        out_->body_buffers.emplace_back(bitmap);
+        buf_agg_->WithBuffer(bitmap);
       } else {
         // Push a dummy zero-length buffer, not to be copied
-        out_->body_buffers.emplace_back(kNullBuffer);
+        buf_agg_->WithBuffer(kNullBuffer);
       }
     }
-    return VisitType(arr);
+    auto status = VisitType(arr);
+    buf_agg_->SealArray(arr);
+    return status;
   }
 
-  // Override this for writing dictionary metadata
-  virtual Status SerializeMetadata(int64_t num_rows) {
-    return WriteRecordBatchMessage(num_rows, out_->body_length, custom_metadata_,
-                                   field_nodes_, buffer_meta_, options_, &out_->metadata);
-  }
+  Status Assemble(const std::vector<std::shared_ptr<Array>>& arrs) {
+    buf_agg_->Clear();
 
-  Status CompressBuffer(const Buffer& buffer, util::Codec* codec,
-                        std::shared_ptr<Buffer>* out) {
-    // Convert buffer to uncompressed-length-prefixed compressed buffer
-    int64_t maximum_length = codec->MaxCompressedLen(buffer.size(), buffer.data());
-    ARROW_ASSIGN_OR_RAISE(auto result, AllocateBuffer(maximum_length + sizeof(int64_t)));
-
-    int64_t actual_length;
-    ARROW_ASSIGN_OR_RAISE(actual_length,
-                          codec->Compress(buffer.size(), buffer.data(), maximum_length,
-                                          result->mutable_data() + sizeof(int64_t)));
-    *reinterpret_cast<int64_t*>(result->mutable_data()) =
-        bit_util::ToLittleEndian(buffer.size());
-    *out = SliceBuffer(std::move(result), /*offset=*/0, actual_length + sizeof(int64_t));
+    // Perform depth-first traversal of the row-batch
+    for (auto& arr : arrs) {
+      RETURN_NOT_OK(VisitArray(*arr));
+    }
     return Status::OK();
   }
 
-  Status CompressBodyBuffers() {
-    RETURN_NOT_OK(
-        internal::CheckCompressionSupported(options_.codec->compression_type()));
-
-    auto CompressOne = [&](size_t i) {
-      if (out_->body_buffers[i]->size() > 0) {
-        RETURN_NOT_OK(CompressBuffer(*out_->body_buffers[i], options_.codec.get(),
-                                     &out_->body_buffers[i]));
-      }
-      return Status::OK();
-    };
-
-    return ::arrow::internal::OptionalParallelFor(
-        options_.use_threads, static_cast<int>(out_->body_buffers.size()), CompressOne);
-  }
-
-  Status Assemble(const RecordBatch& batch) {
-    if (field_nodes_.size() > 0) {
-      field_nodes_.clear();
-      buffer_meta_.clear();
-      out_->body_buffers.clear();
-    }
-
-    // Perform depth-first traversal of the row-batch
-    for (int i = 0; i < batch.num_columns(); ++i) {
-      RETURN_NOT_OK(VisitArray(*batch.column(i)));
-    }
-
-    // calculate initial body length using all buffer sizes
-    int64_t raw_size = 0;
-    for (const auto& buf : out_->body_buffers) {
-      if (buf) {
-        raw_size += buf->size();
-      }
-    }
-    out_->raw_body_length = raw_size;
-
-    if (options_.codec != nullptr) {
-      RETURN_NOT_OK(CompressBodyBuffers());
-    }
-
-    // The position for the start of a buffer relative to the passed frame of
-    // reference. May be 0 or some other position in an address space
-    int64_t offset = buffer_start_offset_;
-
-    buffer_meta_.reserve(out_->body_buffers.size());
-
-    // Construct the buffer metadata for the record batch header
-    for (const auto& buffer : out_->body_buffers) {
-      int64_t size = 0;
-      int64_t padding = 0;
-
-      // The buffer might be null if we are handling zero row lengths.
-      if (buffer) {
-        size = buffer->size();
-        padding = bit_util::RoundUpToMultipleOf8(size) - size;
-      }
-
-      buffer_meta_.push_back({offset, size});
-      offset += size + padding;
-    }
-
-    out_->body_length = offset - buffer_start_offset_;
-    DCHECK(bit_util::IsMultipleOf8(out_->body_length));
-
-    // Now that we have computed the locations of all of the buffers in shared
-    // memory, the data header can be converted to a flatbuffer and written out
-    //
-    // Note: The memory written here is prefixed by the size of the flatbuffer
-    // itself as an int32_t.
-    return SerializeMetadata(batch.num_rows());
+  Status Assemble(std::shared_ptr<Array> arr) {
+    return Assemble(std::vector<std::shared_ptr<Array>>{arr});
   }
 
   template <typename ArrayType>
@@ -307,7 +238,7 @@ class RecordBatchSerializer {
     std::shared_ptr<Buffer> data;
     RETURN_NOT_OK(GetTruncatedBitmap(array.offset(), array.length(), array.values(),
                                      options_.memory_pool, &data));
-    out_->body_buffers.emplace_back(data);
+    buf_agg_->WithBuffer(data);
     return Status::OK();
   }
 
@@ -334,7 +265,7 @@ class RecordBatchSerializer {
                    data->size() - byte_offset);
       data = SliceBuffer(data, byte_offset, buffer_length);
     }
-    out_->body_buffers.emplace_back(data);
+    buf_agg_->WithBuffer(data);
     return Status::OK();
   }
 
@@ -356,8 +287,8 @@ class RecordBatchSerializer {
       data = SliceBuffer(data, start_offset, slice_length);
     }
 
-    out_->body_buffers.emplace_back(value_offsets);
-    out_->body_buffers.emplace_back(data);
+    buf_agg_->WithBuffer(value_offsets);
+    buf_agg_->WithBuffer(data);
     return Status::OK();
   }
 
@@ -367,7 +298,7 @@ class RecordBatchSerializer {
 
     std::shared_ptr<Buffer> value_offsets;
     RETURN_NOT_OK(GetZeroBasedValueOffsets<T>(array, &value_offsets));
-    out_->body_buffers.emplace_back(value_offsets);
+    buf_agg_->WithBuffer(value_offsets);
 
     --max_recursion_depth_;
     std::shared_ptr<Array> values = array.values();
@@ -416,7 +347,7 @@ class RecordBatchSerializer {
     RETURN_NOT_OK(GetTruncatedBuffer(
         offset, length, static_cast<int32_t>(sizeof(UnionArray::type_code_t)),
         array.type_codes(), options_.memory_pool, &type_codes));
-    out_->body_buffers.emplace_back(type_codes);
+    buf_agg_->WithBuffer(type_codes);
 
     --max_recursion_depth_;
     for (int i = 0; i < array.num_fields(); ++i) {
@@ -435,7 +366,7 @@ class RecordBatchSerializer {
     RETURN_NOT_OK(GetTruncatedBuffer(
         offset, length, static_cast<int32_t>(sizeof(UnionArray::type_code_t)),
         array.type_codes(), options_.memory_pool, &type_codes));
-    out_->body_buffers.emplace_back(type_codes);
+    buf_agg_->WithBuffer(type_codes);
 
     --max_recursion_depth_;
     const auto& type = checked_cast<const UnionType&>(*array.type());
@@ -494,7 +425,7 @@ class RecordBatchSerializer {
 
       value_offsets = std::move(shifted_offsets_buffer);
     }
-    out_->body_buffers.emplace_back(value_offsets);
+    buf_agg_->WithBuffer(value_offsets);
 
     // Visit children and slice accordingly
     for (int i = 0; i < type.num_fields(); ++i) {
@@ -529,6 +460,184 @@ class RecordBatchSerializer {
   Status Visit(const ExtensionArray& array) { return VisitType(*array.storage()); }
 
   Status VisitType(const Array& values) { return VisitArrayInline(values, this); }
+
+ protected:
+  // Destination for output buffers
+  BufferAggregator* buf_agg_;
+
+  const ArraySerializationOptions& options_;
+  int64_t max_recursion_depth_;
+};
+
+class ArraySerializerBufferAggregator : public BufferAggregator {
+ public:
+  void WithArray(const Array& arr) {
+    auto new_payload = SerializedArrayPayload::Make(arr.type(), arr.offset(),
+                                                    arr.length(), arr.null_count());
+    if (current_ == nullptr) {
+      // Top-level array.
+      out_ = new_payload;
+    } else {
+      current_->children.emplace_back(new_payload);
+      new_payload->parent = current_;
+    }
+    current_ = new_payload;
+  }
+
+  void WithBuffer(std::shared_ptr<Buffer> buf) { current_->buffers.emplace_back(buf); }
+
+  void SealArray(const Array& arr) {
+    auto parent = current_->parent;
+    // Unset parent field since we no longer need it.
+    current_->parent = nullptr;
+    current_ = parent;
+  }
+
+  std::shared_ptr<SerializedArrayPayload> GetPayload() { return out_; }
+
+  void Clear() {
+    out_ = nullptr;
+    current_ = nullptr;
+  }
+
+ protected:
+  std::shared_ptr<SerializedArrayPayload> out_ = nullptr;
+  std::shared_ptr<SerializedArrayPayload> current_ = nullptr;
+};
+
+class IpcBufferAggregator : public BufferAggregator {
+ public:
+  IpcBufferAggregator(std::vector<std::shared_ptr<Buffer>>* out_buffers,
+                      std::vector<internal::FieldMetadata>* out_field_nodes)
+      : out_buffers_(out_buffers), out_field_nodes_(out_field_nodes) {}
+
+  void WithArray(const Array& arr) {
+    out_field_nodes_->push_back({arr.length(), arr.null_count(), 0});
+  }
+
+  void WithBuffer(std::shared_ptr<Buffer> buf) { out_buffers_->emplace_back(buf); }
+
+  void Clear() {
+    out_field_nodes_->clear();
+    out_buffers_->clear();
+  }
+
+ protected:
+  std::vector<std::shared_ptr<Buffer>>* out_buffers_;
+  std::vector<internal::FieldMetadata>* out_field_nodes_;
+};
+
+class RecordBatchSerializer {
+ public:
+  RecordBatchSerializer(int64_t buffer_start_offset,
+                        const std::shared_ptr<const KeyValueMetadata>& custom_metadata,
+                        const IpcWriteOptions& options, IpcPayload* out)
+      : out_(out),
+        custom_metadata_(custom_metadata),
+        options_(options),
+        max_recursion_depth_(options.max_recursion_depth),
+        buffer_start_offset_(buffer_start_offset) {
+    DCHECK_GT(max_recursion_depth_, 0);
+  }
+
+  virtual ~RecordBatchSerializer() = default;
+
+  // Override this for writing dictionary metadata
+  virtual Status SerializeMetadata(int64_t num_rows) {
+    return WriteRecordBatchMessage(num_rows, out_->body_length, custom_metadata_,
+                                   field_nodes_, buffer_meta_, options_, &out_->metadata);
+  }
+
+  Status CompressBuffer(const Buffer& buffer, util::Codec* codec,
+                        std::shared_ptr<Buffer>* out) {
+    // Convert buffer to uncompressed-length-prefixed compressed buffer
+    int64_t maximum_length = codec->MaxCompressedLen(buffer.size(), buffer.data());
+    ARROW_ASSIGN_OR_RAISE(auto result, AllocateBuffer(maximum_length + sizeof(int64_t)));
+
+    int64_t actual_length;
+    ARROW_ASSIGN_OR_RAISE(actual_length,
+                          codec->Compress(buffer.size(), buffer.data(), maximum_length,
+                                          result->mutable_data() + sizeof(int64_t)));
+    *reinterpret_cast<int64_t*>(result->mutable_data()) =
+        bit_util::ToLittleEndian(buffer.size());
+    *out = SliceBuffer(std::move(result), /*offset=*/0, actual_length + sizeof(int64_t));
+    return Status::OK();
+  }
+
+  Status CompressBodyBuffers() {
+    RETURN_NOT_OK(
+        internal::CheckCompressionSupported(options_.codec->compression_type()));
+
+    auto CompressOne = [&](size_t i) {
+      if (out_->body_buffers[i]->size() > 0) {
+        RETURN_NOT_OK(CompressBuffer(*out_->body_buffers[i], options_.codec.get(),
+                                     &out_->body_buffers[i]));
+      }
+      return Status::OK();
+    };
+
+    return ::arrow::internal::OptionalParallelFor(
+        options_.use_threads, static_cast<int>(out_->body_buffers.size()), CompressOne);
+  }
+
+  Status Assemble(const RecordBatch& batch) {
+    if (field_nodes_.size() > 0) {
+      field_nodes_.clear();
+      buffer_meta_.clear();
+      out_->body_buffers.clear();
+    }
+
+    ArraySerializationOptions options = {options_.allow_64bit,
+                                         options_.max_recursion_depth,
+                                         options_.memory_pool, options_.metadata_version};
+    IpcBufferAggregator buf_agg(&out_->body_buffers, &field_nodes_);
+    ArraySerializer array_assembler(options, &buf_agg);
+    RETURN_NOT_OK(array_assembler.Assemble(batch.columns()));
+
+    // calculate initial body length using all buffer sizes
+    int64_t raw_size = 0;
+    for (const auto& buf : out_->body_buffers) {
+      if (buf) {
+        raw_size += buf->size();
+      }
+    }
+    out_->raw_body_length = raw_size;
+
+    if (options_.codec != nullptr) {
+      RETURN_NOT_OK(CompressBodyBuffers());
+    }
+
+    // The position for the start of a buffer relative to the passed frame of
+    // reference. May be 0 or some other position in an address space
+    int64_t offset = buffer_start_offset_;
+
+    buffer_meta_.reserve(out_->body_buffers.size());
+
+    // Construct the buffer metadata for the record batch header
+    for (const auto& buffer : out_->body_buffers) {
+      int64_t size = 0;
+      int64_t padding = 0;
+
+      // The buffer might be null if we are handling zero row lengths.
+      if (buffer) {
+        size = buffer->size();
+        padding = bit_util::RoundUpToMultipleOf8(size) - size;
+      }
+
+      buffer_meta_.push_back({offset, size});
+      offset += size + padding;
+    }
+
+    out_->body_length = offset - buffer_start_offset_;
+    DCHECK(bit_util::IsMultipleOf8(out_->body_length));
+
+    // Now that we have computed the locations of all of the buffers in shared
+    // memory, the data header can be converted to a flatbuffer and written out
+    //
+    // Note: The memory written here is prefixed by the size of the flatbuffer
+    // itself as an int32_t.
+    return SerializeMetadata(batch.num_rows());
+  }
 
  protected:
   // Destination for output buffers
@@ -571,6 +680,30 @@ class DictionarySerializer : public RecordBatchSerializer {
 };
 
 }  // namespace
+
+Result<std::shared_ptr<SerializedArrayPayload>> SerializeArray(
+    std::shared_ptr<Array> arr) {
+  ArraySerializationOptions options;
+  ArraySerializerBufferAggregator buf_agg;
+  ArraySerializer array_assembler(options, &buf_agg);
+  RETURN_NOT_OK(array_assembler.Assemble(arr));
+  return buf_agg.GetPayload();
+};
+
+std::shared_ptr<ArrayData> DeserializeArrayData(
+    std::shared_ptr<SerializedArrayPayload> payload) {
+  std::vector<std::shared_ptr<ArrayData>> children;
+  for (auto& child : payload->children) {
+    children.emplace_back(DeserializeArrayData(child));
+  }
+  return std::make_shared<ArrayData>(payload->type, payload->length, payload->buffers,
+                                     children, payload->null_count, payload->offset);
+};
+
+std::shared_ptr<Array> DeserializeArray(std::shared_ptr<SerializedArrayPayload> payload) {
+  auto array_data = DeserializeArrayData(payload);
+  return MakeArray(array_data);
+};
 
 Status WriteIpcPayload(const IpcPayload& payload, const IpcWriteOptions& options,
                        io::OutputStream* dst, int32_t* metadata_length) {
