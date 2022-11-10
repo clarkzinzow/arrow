@@ -62,7 +62,7 @@ struct IpcPayload {
 };
 
 /// \brief Options for serializing Arrow Arrays
-struct ARROW_EXPORT ArraySerializationOptions {
+struct ArraySerializationOptions {
   /// \brief If true, allow field lengths that don't fit in a signed 32-bit int.
   ///
   /// Some implementations may not be able to parse streams created with this option.

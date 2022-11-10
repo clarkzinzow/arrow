@@ -685,7 +685,7 @@ cdef class SerializedArrayPayload(_Weakrefable):
 cdef SerializedArrayPayload _reduce_array(Array arr):
     cdef shared_ptr[CSerializedArrayPayload] c_payload
 
-    c_payload = GetResultValue(CSerializeArray(pyarrow_unwrap_array(arr)))
+    c_payload = GetResultValue(SerializeArray(pyarrow_unwrap_array(arr)))
     return SerializedArrayPayload.wrap(c_payload)
 
 
@@ -693,7 +693,7 @@ def _restore_array(SerializedArrayPayload payload):
     cdef shared_ptr[CSerializedArrayPayload] c_payload
 
     c_pyload = payload.unwrap()
-    return pyarrow_wrap_array(CDeserializeArray(c_payload))
+    return pyarrow_wrap_array(DeserializeArray(c_payload))
 
 
 cdef class _PandasConvertible(_Weakrefable):

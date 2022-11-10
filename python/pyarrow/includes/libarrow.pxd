@@ -1560,7 +1560,7 @@ cdef extern from "arrow/ipc/api.h" namespace "arrow::ipc" nogil:
         vector[shared_ptr[CBuffer]] body_buffers
         int64_t body_length
 
-    cdef cppclass CSerializedArrayPayload" arrow::ipc::SerializedArrayPayload":
+    cdef cppclass CSerializedArrayPayload "arrow::ipc::SerializedArrayPayload":
         shared_ptr[CDataType] type
         int64_t offset
         int64_t length
@@ -1578,10 +1578,10 @@ cdef extern from "arrow/ipc/api.h" namespace "arrow::ipc" nogil:
             const vector[shared_ptr[CBuffer]]& buffers,
             const vector[shared_ptr[CSerializedArrayPayload]]& children)
 
-    cdef CResult[shared_ptr[CSerializedArrayPayload]] CSerializeArray(
+    CResult[shared_ptr[CSerializedArrayPayload]] SerializeArray(
         shared_ptr[CArray] arr)
 
-    cdef shared_ptr[CArray] CDeserializeArray(
+    shared_ptr[CArray] DeserializeArray(
         shared_ptr[CSerializedArrayPayload] payload)
 
     cdef cppclass CMessage" arrow::ipc::Message":
