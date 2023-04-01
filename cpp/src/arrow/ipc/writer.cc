@@ -128,13 +128,18 @@ static inline bool NeedTruncate(int64_t offset, const Buffer* buffer,
 class BufferAggregator {
  public:
   /// \brief Preorder hook for an Array that's about to be serialized.
-  virtual void WithArray(const Array& arr) = 0;
+  virtual void WithArray(const Array& arr, bool is_dictionary) = 0;
 
   /// \brief Buffer that has been serialized.
   virtual void WithBuffer(std::shared_ptr<Buffer> buf) = 0;
 
   /// \brief Postorder hook for an Array that's done being serialized.
   virtual void SealArray(const Array& arr) {}
+
+  /// \brief Whether dictionary data buffers should be aggregate; if not, it's assumed
+  /// the dictionary data buffers are aggregated out-of-band (this is the case for the
+  /// IPC path).
+  virtual bool ShouldAggregateDictionaryData() = 0;
 
   /// \brief Invoked before starting serialization for batch of Arrays.
   virtual void Clear() = 0;
@@ -151,7 +156,7 @@ class ArraySerializer {
 
   virtual ~ArraySerializer() = default;
 
-  Status VisitArray(const Array& arr) {
+  Status VisitArray(const Array& arr, bool is_dictionary = false) {
     static std::shared_ptr<Buffer> kNullBuffer = std::make_shared<Buffer>(nullptr, 0);
 
     if (max_recursion_depth_ <= 0) {
@@ -162,7 +167,7 @@ class ArraySerializer {
       return Status::CapacityError("Cannot write arrays larger than 2^31 - 1 in length");
     }
 
-    buf_agg_->WithArray(arr);
+    buf_agg_->WithArray(arr, is_dictionary);
 
     // In V4, null types have no validity bitmap
     // In V5 and later, null and union types have no validity bitmap
@@ -185,7 +190,7 @@ class ArraySerializer {
   Status Assemble(const std::vector<std::shared_ptr<Array>>& arrs) {
     buf_agg_->Clear();
 
-    // Perform depth-first traversal of the row-batch
+    // Perform depth-first traversal of the arrays
     for (auto& arr : arrs) {
       RETURN_NOT_OK(VisitArray(*arr));
     }
@@ -453,7 +458,9 @@ class ArraySerializer {
   }
 
   Status Visit(const DictionaryArray& array) {
-    // Dictionary written out separately. Slice offset contained in the indices
+    if (buf_agg_->ShouldAggregateDictionaryData()) {
+      RETURN_NOT_OK(VisitArray(*array.dictionary(), /*is_dictionary=*/true));
+    }
     return VisitType(*array.indices());
   }
 
@@ -471,20 +478,28 @@ class ArraySerializer {
 
 class ArraySerializerBufferAggregator : public BufferAggregator {
  public:
-  void WithArray(const Array& arr) {
-    auto new_payload = SerializedArrayPayload::Make(arr.type(), arr.offset(),
-                                                    arr.length(), arr.null_count());
+  void WithArray(const Array& arr, bool is_dictionary) {
+    auto new_payload = ArrayBufferPayload::Make(arr.type(), arr.offset(), arr.length(),
+                                                arr.null_count());
     if (current_ == nullptr) {
+      DCHECK(!is_dictionary);
       // Top-level array.
       out_ = new_payload;
     } else {
-      current_->children.emplace_back(new_payload);
+      if (is_dictionary) {
+        current_->dictionary = new_payload;
+      } else {
+        current_->children.emplace_back(new_payload);
+      }
       new_payload->parent = current_;
     }
     current_ = new_payload;
   }
 
   void WithBuffer(std::shared_ptr<Buffer> buf) { current_->buffers.emplace_back(buf); }
+
+  // Dictionary written out separately.
+  bool ShouldAggregateDictionaryData() { return true; }
 
   void SealArray(const Array& arr) {
     auto parent = current_->parent;
@@ -493,7 +508,7 @@ class ArraySerializerBufferAggregator : public BufferAggregator {
     current_ = parent;
   }
 
-  std::shared_ptr<SerializedArrayPayload> GetPayload() { return out_; }
+  std::shared_ptr<ArrayBufferPayload> GetPayload() { return out_; }
 
   void Clear() {
     out_ = nullptr;
@@ -501,8 +516,8 @@ class ArraySerializerBufferAggregator : public BufferAggregator {
   }
 
  protected:
-  std::shared_ptr<SerializedArrayPayload> out_ = nullptr;
-  std::shared_ptr<SerializedArrayPayload> current_ = nullptr;
+  std::shared_ptr<ArrayBufferPayload> out_ = nullptr;
+  std::shared_ptr<ArrayBufferPayload> current_ = nullptr;
 };
 
 class IpcBufferAggregator : public BufferAggregator {
@@ -511,11 +526,15 @@ class IpcBufferAggregator : public BufferAggregator {
                       std::vector<internal::FieldMetadata>* out_field_nodes)
       : out_buffers_(out_buffers), out_field_nodes_(out_field_nodes) {}
 
-  void WithArray(const Array& arr) {
+  void WithArray(const Array& arr, bool is_dictionary) {
+    DCHECK(!is_dictionary);
     out_field_nodes_->push_back({arr.length(), arr.null_count(), 0});
   }
 
   void WithBuffer(std::shared_ptr<Buffer> buf) { out_buffers_->emplace_back(buf); }
+
+  // Dictionary written out separately.
+  bool ShouldAggregateDictionaryData() { return false; }
 
   void Clear() {
     out_field_nodes_->clear();
@@ -681,8 +700,9 @@ class DictionarySerializer : public RecordBatchSerializer {
 
 }  // namespace
 
-Result<std::shared_ptr<SerializedArrayPayload>> SerializeArray(
+Result<std::shared_ptr<ArrayBufferPayload>> ArrayToBufferPayload(
     std::shared_ptr<Array> arr) {
+  DCHECK(arr != nullptr) << "null array";
   ArraySerializationOptions options;
   ArraySerializerBufferAggregator buf_agg;
   ArraySerializer array_assembler(options, &buf_agg);
@@ -690,18 +710,40 @@ Result<std::shared_ptr<SerializedArrayPayload>> SerializeArray(
   return buf_agg.GetPayload();
 };
 
-std::shared_ptr<ArrayData> DeserializeArrayData(
-    std::shared_ptr<SerializedArrayPayload> payload) {
+std::shared_ptr<ArrayData> BufferPayloadToArrayData(
+    std::shared_ptr<ArrayBufferPayload> payload) {
+  DCHECK(payload != nullptr) << "null payload";
   std::vector<std::shared_ptr<ArrayData>> children;
-  for (auto& child : payload->children) {
-    children.emplace_back(DeserializeArrayData(child));
+  children.reserve(payload->children.size());
+  for (const auto& child : payload->children) {
+    children.emplace_back(BufferPayloadToArrayData(child));
   }
-  return std::make_shared<ArrayData>(payload->type, payload->length, payload->buffers,
-                                     children, payload->null_count, payload->offset);
+  auto buffers = payload->buffers;
+  auto null_count = payload->null_count;
+  auto& type = payload->type;
+  if (internal::HasValidityBitmap(type->id(), payload->metadata_version) &&
+      null_count == 0) {
+    // Reset null bitmap buffer.
+    buffers[0].reset(new Buffer(nullptr, 0));
+  }
+  if (type->id() == Type::type::NA) {
+    buffers.resize(1);
+  }
+  if (type->id() == Type::type::SPARSE_UNION || type->id() == Type::type::DENSE_UNION) {
+    // Union format expects an extra null first buffer.
+    buffers.insert(buffers.begin(), nullptr);
+  }
+  auto array = std::make_shared<ArrayData>(type, payload->length, buffers, children,
+                                           null_count, payload->offset);
+  if (payload->dictionary != nullptr) {
+    array->dictionary = BufferPayloadToArrayData(payload->dictionary);
+  }
+  return array;
 };
 
-std::shared_ptr<Array> DeserializeArray(std::shared_ptr<SerializedArrayPayload> payload) {
-  auto array_data = DeserializeArrayData(payload);
+std::shared_ptr<Array> BufferPayloadToArray(std::shared_ptr<ArrayBufferPayload> payload) {
+  DCHECK(payload != nullptr) << "null payload";
+  const auto& array_data = BufferPayloadToArrayData(payload);
   return MakeArray(array_data);
 };
 

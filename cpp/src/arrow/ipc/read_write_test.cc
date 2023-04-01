@@ -49,9 +49,11 @@
 #include "arrow/testing/util.h"
 #include "arrow/type_fwd.h"
 #include "arrow/util/bit_util.h"
+#include "arrow/util/byte_size.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/io_util.h"
 #include "arrow/util/key_value_metadata.h"
+#include "arrow/util/logging.h"
 
 #include "generated/Message_generated.h"  // IWYU pragma: keep
 
@@ -3069,6 +3071,113 @@ TEST(PreBuffering, MixedAccess) {
   auto stats = reader->stats();
   ASSERT_EQ(1, stats.num_dictionary_batches);
   ASSERT_EQ(2, stats.num_record_batches);
+}
+
+class TestBufferPayload : public ::testing::Test {
+ public:
+  void SetUp() {}
+
+  void CheckRoundtrip(const std::shared_ptr<Array>& array, std::shared_ptr<Array>& out) {
+    ARROW_LOG(INFO) << "Before - num_buffers = " << array->data()->buffers.size()
+                    << ", num_children = " << array->data()->child_data.size();
+    ASSERT_OK_AND_ASSIGN(auto payload, ArrayToBufferPayload(array));
+    ARROW_LOG(INFO) << "Before payload - num_buffers = " << payload->buffers.size()
+                    << ", num_children = " << payload->children.size();
+    auto result = BufferPayloadToArray(payload);
+    ARROW_LOG(INFO) << "After - num_buffers = " << result->data()->buffers.size()
+                    << ", num_children = " << result->data()->child_data.size();
+    ASSERT_TRUE(result->Equals(array));
+    out = result;
+  }
+};
+
+TEST_F(TestBufferPayload, Roundtrip) {
+  std::shared_ptr<Array> a;
+  auto pool = default_memory_pool();
+  // Integer
+  ASSERT_OK(MakeRandomInt32Array(500, false, pool, &a));
+  std::shared_ptr<Array> rt_array;
+  CheckRoundtrip(a, rt_array);
+}
+
+TEST_F(TestBufferPayload, SliceTruncatesBuffers) {
+  auto CheckArray = [this](const std::shared_ptr<Array>& array) {
+    auto sliced_array = array->Slice(0, 5);
+
+    ASSERT_OK_AND_ASSIGN(int64_t full_size, arrow::util::ReferencedBufferSize(*array));
+    ASSERT_OK_AND_ASSIGN(int64_t sliced_size,
+                         arrow::util::ReferencedBufferSize(*sliced_array));
+    ASSERT_TRUE(sliced_size < full_size) << sliced_size << " " << full_size;
+
+    // make sure we can serialize and deserialize it
+    std::shared_ptr<Array> rt_array;
+    this->CheckRoundtrip(sliced_array, rt_array);
+    int64_t rt_total_size = arrow::util::TotalBufferSize(*rt_array);
+    ASSERT_TRUE(rt_total_size < full_size) << rt_total_size << " " << sliced_size;
+  };
+
+  std::shared_ptr<Array> a0, a1;
+  auto pool = default_memory_pool();
+
+  // Integer
+  ASSERT_OK(MakeRandomInt32Array(500, false, pool, &a0));
+  CheckArray(a0);
+
+  // String / Binary
+  {
+    auto s = MakeRandomStringArray(500, false, pool, &a0);
+    ASSERT_TRUE(s.ok());
+  }
+  CheckArray(a0);
+
+  // Boolean
+  ASSERT_OK(MakeRandomBooleanArray(10000, false, &a0));
+  CheckArray(a0);
+
+  // List
+  ASSERT_OK(MakeRandomInt32Array(500, false, pool, &a0));
+  ASSERT_OK(MakeRandomListArray(a0, 200, false, pool, &a1));
+  CheckArray(a1);
+
+  // Struct
+  auto struct_type = struct_({field("f0", a0->type())});
+  std::vector<std::shared_ptr<Array>> struct_children = {a0};
+  a1 = std::make_shared<StructArray>(struct_type, a0->length(), struct_children);
+  CheckArray(a1);
+
+  // Sparse Union
+  auto union_type = sparse_union({field("f0", a0->type())}, {0});
+  std::vector<int32_t> type_ids(a0->length());
+  std::shared_ptr<Buffer> ids_buffer;
+  ASSERT_OK(CopyBufferFromVector(type_ids, default_memory_pool(), &ids_buffer));
+  a1 = std::make_shared<SparseUnionArray>(union_type, a0->length(), struct_children,
+                                          ids_buffer);
+  CheckArray(a1);
+
+  // Dense union
+  auto dense_union_type = dense_union({field("f0", a0->type())}, {0});
+  std::vector<int32_t> type_offsets;
+  for (int32_t i = 0; i < a0->length(); ++i) {
+    type_offsets.push_back(i);
+  }
+  std::shared_ptr<Buffer> offsets_buffer;
+  ASSERT_OK(CopyBufferFromVector(type_offsets, default_memory_pool(), &offsets_buffer));
+  a1 = std::make_shared<DenseUnionArray>(dense_union_type, a0->length(), struct_children,
+                                         ids_buffer, offsets_buffer);
+  CheckArray(a1);
+
+  // Dictionary
+  random::RandomArrayGenerator rg(/*seed=*/0);
+  int64_t length = 500;
+  int dict_size = 50;
+  std::shared_ptr<Array> dict =
+      rg.String(dict_size, /*min_length=*/5, /*max_length=*/5, /*null_probability=*/0);
+  std::shared_ptr<Array> indices =
+      rg.Int32(length, /*min=*/0, /*max=*/dict_size - 1, /*null_probability=*/0.1);
+  auto dict_type = dictionary(int32(), utf8());
+  ASSERT_OK_AND_ASSIGN(auto dict_array,
+                       DictionaryArray::FromArrays(dict_type, indices, dict));
+  CheckArray(dict_array);
 }
 
 }  // namespace test

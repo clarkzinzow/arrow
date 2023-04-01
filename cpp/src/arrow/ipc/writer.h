@@ -109,17 +109,19 @@ struct WriteStats {
   int64_t total_serialized_body_size = 0;
 };
 
-struct ARROW_EXPORT SerializedArrayPayload {
-  SerializedArrayPayload(std::shared_ptr<DataType> type, int64_t offset, int64_t length,
-                         int64_t null_count, std::vector<std::shared_ptr<Buffer>> buffers,
-                         std::vector<std::shared_ptr<SerializedArrayPayload>> children,
-                         std::shared_ptr<SerializedArrayPayload> parent = nullptr)
+struct ARROW_EXPORT ArrayBufferPayload {
+  ArrayBufferPayload(std::shared_ptr<DataType> type, int64_t offset, int64_t length,
+                     int64_t null_count, std::vector<std::shared_ptr<Buffer>> buffers,
+                     std::vector<std::shared_ptr<ArrayBufferPayload>> children,
+                     std::shared_ptr<ArrayBufferPayload> dictionary = nullptr,
+                     std::shared_ptr<ArrayBufferPayload> parent = nullptr)
       : type(type),
         offset(offset),
         length(length),
         null_count(null_count),
         buffers(buffers),
         children(children),
+        dictionary(dictionary),
         parent(parent) {}
 
   std::shared_ptr<DataType> type;
@@ -127,26 +129,34 @@ struct ARROW_EXPORT SerializedArrayPayload {
   int64_t length;
   int64_t null_count;
   std::vector<std::shared_ptr<Buffer>> buffers;
-  std::vector<std::shared_ptr<SerializedArrayPayload>> children;
-  std::shared_ptr<SerializedArrayPayload> parent;
+  std::vector<std::shared_ptr<ArrayBufferPayload>> children;
+  std::shared_ptr<ArrayBufferPayload> dictionary;
+  std::shared_ptr<ArrayBufferPayload> parent;
 
-  static std::shared_ptr<SerializedArrayPayload> Make(
+  /// \brief Format version to use for IPC messages and their metadata.
+  ///
+  /// Presently using V5 version (readable by 1.0.0 and later).
+  /// V4 is also available (readable by 0.8.0 and later).
+  MetadataVersion metadata_version = MetadataVersion::V5;
+
+  static std::shared_ptr<ArrayBufferPayload> Make(
       std::shared_ptr<DataType> type, int64_t offset, int64_t length, int64_t null_count,
       std::vector<std::shared_ptr<Buffer>> buffers =
           std::vector<std::shared_ptr<Buffer>>(),
-      std::vector<std::shared_ptr<SerializedArrayPayload>> children =
-          std::vector<std::shared_ptr<SerializedArrayPayload>>()) {
-    return std::make_shared<SerializedArrayPayload>(std::move(type), offset, length,
-                                                    null_count, std::move(buffers),
-                                                    std::move(children));
+      std::vector<std::shared_ptr<ArrayBufferPayload>> children =
+          std::vector<std::shared_ptr<ArrayBufferPayload>>(),
+      std::shared_ptr<ArrayBufferPayload> dictionary = nullptr) {
+    return std::make_shared<ArrayBufferPayload>(std::move(type), offset, length,
+                                                null_count, std::move(buffers),
+                                                std::move(children), dictionary);
   };
 };
 
-ARROW_EXPORT Result<std::shared_ptr<SerializedArrayPayload>> SerializeArray(
+ARROW_EXPORT Result<std::shared_ptr<ArrayBufferPayload>> ArrayToBufferPayload(
     std::shared_ptr<Array> arr);
 
-ARROW_EXPORT std::shared_ptr<Array> DeserializeArray(
-    std::shared_ptr<SerializedArrayPayload> payload);
+ARROW_EXPORT std::shared_ptr<Array> BufferPayloadToArray(
+    std::shared_ptr<ArrayBufferPayload> payload);
 
 /// \class RecordBatchWriter
 /// \brief Abstract interface for writing a stream of record batches

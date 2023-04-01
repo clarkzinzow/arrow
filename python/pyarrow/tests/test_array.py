@@ -1967,6 +1967,7 @@ def test_array_pickle(data, typ):
     # This is needed to ensure that allocator tests can be reliable.
     array = pa.array(data, type=typ)
     for proto in range(0, pickle.HIGHEST_PROTOCOL + 1):
+        print("before buffers:", array.buffers())
         result = pickle.loads(pickle.dumps(array, proto))
         assert array.equals(result)
 

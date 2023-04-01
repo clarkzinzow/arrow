@@ -1560,29 +1560,31 @@ cdef extern from "arrow/ipc/api.h" namespace "arrow::ipc" nogil:
         vector[shared_ptr[CBuffer]] body_buffers
         int64_t body_length
 
-    cdef cppclass CSerializedArrayPayload "arrow::ipc::SerializedArrayPayload":
+    cdef cppclass CArrayBufferPayload "arrow::ipc::ArrayBufferPayload":
         shared_ptr[CDataType] type
         int64_t offset
         int64_t length
         int64_t null_count
         vector[shared_ptr[CBuffer]] buffers
-        vector[shared_ptr[CSerializedArrayPayload]] children
-        shared_ptr[CSerializedArrayPayload] parent
+        vector[shared_ptr[CArrayBufferPayload]] children
+        shared_ptr[CArrayBufferPayload] dictionary
+        shared_ptr[CArrayBufferPayload] parent
 
         @staticmethod
-        shared_ptr[CSerializedArrayPayload] Make(
+        shared_ptr[CArrayBufferPayload] Make(
             const shared_ptr[CDataType]& type,
             int64_t offset,
             int64_t length,
             int64_t null_count,
             const vector[shared_ptr[CBuffer]]& buffers,
-            const vector[shared_ptr[CSerializedArrayPayload]]& children)
+            const vector[shared_ptr[CArrayBufferPayload]]& children,
+            const shared_ptr[CArrayBufferPayload]& dictionary)
 
-    CResult[shared_ptr[CSerializedArrayPayload]] SerializeArray(
+    CResult[shared_ptr[CArrayBufferPayload]] ArrayToBufferPayload(
         shared_ptr[CArray] arr)
 
-    shared_ptr[CArray] DeserializeArray(
-        shared_ptr[CSerializedArrayPayload] payload)
+    shared_ptr[CArray] BufferPayloadToArray(
+        shared_ptr[CArrayBufferPayload] payload)
 
     cdef cppclass CMessage" arrow::ipc::Message":
         CResult[unique_ptr[CMessage]] Open(shared_ptr[CBuffer] metadata,

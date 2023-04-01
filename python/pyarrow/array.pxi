@@ -600,46 +600,49 @@ cdef _append_array_buffers(const CArrayData* ad, list res):
     for i in range(n):
         _append_array_buffers(ad.child_data[i].get(), res)
 
-cdef shared_ptr[CSerializedArrayPayload] pyarrow_unwrap_serialized_array_payload(object payload):
-    cdef SerializedArrayPayload sap
-    if isinstance(payload, SerializedArrayPayload):
-        sap = <SerializedArrayPayload>(payload)
+cdef shared_ptr[CArrayBufferPayload] pyarrow_unwrap_serialized_array_payload(object payload):
+    cdef ArrayBufferPayload sap
+    if isinstance(payload, ArrayBufferPayload):
+        sap = <ArrayBufferPayload>(payload)
         return sap.wrapped
-    return shared_ptr[CSerializedArrayPayload]()
+    return shared_ptr[CArrayBufferPayload]()
 
 
-cdef class SerializedArrayPayload(_Weakrefable):
+cdef class ArrayBufferPayload(_Weakrefable):
     cdef:
-        shared_ptr[CSerializedArrayPayload] wrapped
-        CSerializedArrayPayload* sap
+        shared_ptr[CArrayBufferPayload] wrapped
+        CArrayBufferPayload* sap
 
-    def __init__(self, DataType type, int offset, int length, int null_count, list buffers, list children):
+    def __init__(self, DataType type, int offset, int length, int null_count, list buffers, list children, dictionary):
         cdef:
             shared_ptr[CDataType] c_type
             vector[shared_ptr[CBuffer]] c_buffers
-            vector[shared_ptr[CSerializedArrayPayload]] c_children
-            shared_ptr[CSerializedArrayPayload] c_payload
+            vector[shared_ptr[CArrayBufferPayload]] c_children
+            shared_ptr[CArrayBufferPayload] c_dictionary
+            shared_ptr[CArrayBufferPayload] c_payload
 
         c_type = type.sp_type
         for buf in buffers:
             c_buffers.push_back(pyarrow_unwrap_buffer(buf))
         for child in children:
             c_children.push_back(pyarrow_unwrap_serialized_array_payload(child))
-        c_payload = CSerializedArrayPayload.Make(c_type, offset, length, null_count, c_buffers, c_children)
+        c_dictionary = pyarrow_unwrap_serialized_array_payload(dictionary)
+        c_payload = CArrayBufferPayload.Make(
+            c_type, offset, length, null_count, c_buffers, c_children, c_dictionary)
         self.init(c_payload)
 
-    cdef void init(self, const shared_ptr[CSerializedArrayPayload]& sp_sap) except *:
+    cdef void init(self, const shared_ptr[CArrayBufferPayload]& sp_sap) except *:
         self.wrapped = sp_sap
         self.sap = sp_sap.get()
 
     @staticmethod
-    cdef wrap(const shared_ptr[CSerializedArrayPayload]& sp_sap):
-        cdef SerializedArrayPayload self = SerializedArrayPayload.__new__(
-            SerializedArrayPayload)
+    cdef wrap(const shared_ptr[CArrayBufferPayload]& sp_sap):
+        cdef ArrayBufferPayload self = ArrayBufferPayload.__new__(
+            ArrayBufferPayload)
         self.init(sp_sap)
         return self
 
-    cdef shared_ptr[CSerializedArrayPayload] unwrap(self):
+    cdef shared_ptr[CArrayBufferPayload] unwrap(self):
         return self.wrapped
 
     @property
@@ -670,30 +673,53 @@ cdef class SerializedArrayPayload(_Weakrefable):
 
     @property
     def children(self):
-        cdef vector[shared_ptr[CSerializedArrayPayload]] c_children
+        cdef vector[shared_ptr[CArrayBufferPayload]] c_children
         res = []
         c_children = self.sap.children
         for i in range(c_children.size()):
             child = c_children[i]
-            res.append(SerializedArrayPayload.wrap(child))
+            res.append(ArrayBufferPayload.wrap(child))
         return res
 
+    @property
+    def dictionary(self):
+        cdef shared_ptr[CArrayBufferPayload] c_dictionary = self.sap.dictionary
+
+        if c_dictionary == nullptr:
+            return None
+        return ArrayBufferPayload.wrap(c_dictionary)
+
     def __reduce__(self):
-        return SerializedArrayPayload, (self.type, self.offset, self.length, self.null_count, self.buffers, self.children)
+        return ArrayBufferPayload, (
+            self.type,
+            self.offset,
+            self.length,
+            self.null_count,
+            self.buffers,
+            self.children,
+            self.dictionary)
 
 
-cdef SerializedArrayPayload _reduce_array(Array arr):
-    cdef shared_ptr[CSerializedArrayPayload] c_payload
+cdef ArrayBufferPayload _reduce_array(Array arr):
+    cdef shared_ptr[CArrayBufferPayload] c_payload
 
-    c_payload = GetResultValue(SerializeArray(pyarrow_unwrap_array(arr)))
-    return SerializedArrayPayload.wrap(c_payload)
+    c_payload = GetResultValue(ArrayToBufferPayload(pyarrow_unwrap_array(arr)))
+    assert c_payload != nullptr
+    return ArrayBufferPayload.wrap(c_payload)
 
 
-def _restore_array(SerializedArrayPayload payload):
-    cdef shared_ptr[CSerializedArrayPayload] c_payload
+def _restore_array(ArrayBufferPayload payload):
+    cdef shared_ptr[CArrayBufferPayload] c_payload
 
-    c_pyload = payload.unwrap()
-    return pyarrow_wrap_array(DeserializeArray(c_payload))
+    print("offset:", payload.offset)
+    print("length:", payload.length)
+    print("null_count:", payload.null_count)
+    print("buffers:", payload.buffers)
+    print("children:", payload.children)
+    print("dictionary:", payload.dictionary)
+
+    c_payload = payload.unwrap()
+    return pyarrow_wrap_array(BufferPayloadToArray(c_payload))
 
 
 cdef class _PandasConvertible(_Weakrefable):
